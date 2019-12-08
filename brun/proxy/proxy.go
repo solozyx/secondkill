@@ -6,8 +6,8 @@ import (
 
 	"secondkill/proxy/antispam"
 	"secondkill/proxy/conf"
+	"secondkill/proxy/dao"
 	"secondkill/proxy/envinit"
-	"secondkill/proxy/goodsmgr"
 	// router模块不需要使用它里面的函数方法,但需要执行router.init()初始化,下划线 _ 导入做初始化
 	_ "secondkill/proxy/router"
 	"secondkill/proxy/service"
@@ -24,7 +24,7 @@ func main(){
 	envinit.InitProxy()
 
 	// 初始化秒杀商品模块
-	err = goodsmgr.InitGoodsMgr()
+	err = dao.InitGoodsDao()
 	if err != nil {
 		logs.Error("seckill proxy InitGoodsMgr err: %v",err)
 		return
