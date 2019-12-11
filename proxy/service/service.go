@@ -28,14 +28,17 @@ var (
 
 type proxyService struct {
 	// waitGroup *sync.WaitGroup
-	secReqChan chan *request.SecRequest
+	secReqChan             chan *request.SecRequest
+	allUsersSecRespMap     map[string]chan *response.SecResponse
+	allUsersSecRespMapLock sync.Mutex
 }
 
 func InitProxyService() (err error) {
 	G_proxyService = &proxyService{}
 	// G_proxyService.waitGroup = &sync.WaitGroup{}
-	G_proxyService.secReqChan = make(chan *request.SecRequest,
-		conf.G_proxyConf.ChanSizeWriteProxyRequest)
+	G_proxyService.secReqChan = make(chan *request.SecRequest, conf.G_proxyConf.ChanSizeWriteProxyRequest)
+	G_proxyService.allUsersSecRespMap = make(map[string]chan *response.SecResponse, 10000)
+	G_proxyService.allUsersSecRespMapLock = sync.Mutex{}
 	if err = G_proxyService.loadBlackList(); err != nil {
 		logs.Warn("seckill proxy load userid and IP blacklist err: ", err)
 		return
@@ -228,11 +231,11 @@ func (s *proxyService) SecKill(secRequest *request.SecRequest) (seckillInfo map[
 	var (
 		isUserValid         bool
 		userSeckillGoodsKey string
+		ticker              *time.Ticker
+		secResp             *response.SecResponse
 	)
 	seckillInfo = make(map[string]interface{})
-	// TODO dao包的读写锁应该公开么 RWLock ?
-	dao.G_goodsDao.RWLock.RLock()
-	defer dao.G_goodsDao.RWLock.RUnlock()
+
 	//TODO NOTICE 简化测试去掉用户cookie校验 生产环境请接入商城系统获取cookie
 	// 用户从商城系统 登录 进入秒杀系统 用户鉴权
 	if isUserValid = auth.UserCheck(secRequest); !isUserValid {
@@ -255,11 +258,40 @@ func (s *proxyService) SecKill(secRequest *request.SecRequest) (seckillInfo map[
 	}
 
 	userSeckillGoodsKey = fmt.Sprintf("%d_%d", secRequest.UserId, secRequest.GoodsId)
+	s.allUsersSecRespMapLock.Lock()
+	s.allUsersSecRespMap[userSeckillGoodsKey] = secRequest.SecReqRelatedSecRespChan
+	s.allUsersSecRespMapLock.Unlock()
 
 	// 秒杀接入层 把能参与秒杀的请求 放到redis队列
 	// redis做了一个黑名单实例 再做1个redis实例
 	s.secReqChan <- secRequest
-	//...
+
+	// 秒杀接入层 持有1个秒杀请求 10秒 如果10秒没收到逻辑层处理结果 则丢弃该请求
+	ticker = time.NewTicker(time.Second * 10)
+	defer func() {
+		ticker.Stop()
+		s.allUsersSecRespMapLock.Lock()
+		delete(s.allUsersSecRespMap, userSeckillGoodsKey)
+		s.allUsersSecRespMapLock.Unlock()
+	}()
+
+	select {
+	case <-ticker.C:
+		statusCode = constant.ErrProxyWaitLogicRespTimeout
+		err = fmt.Errorf("seckill proxy request timeout")
+		return
+	case <-secRequest.ClientCloseNotify:
+		statusCode = constant.ErrProxyUserClientCloesd
+		err = fmt.Errorf("seckill proxy user client closed")
+		return
+	case secResp = <-secRequest.SecReqRelatedSecRespChan:
+		statusCode = secResp.Code
+		seckillInfo["user_id"] = secResp.UserId
+		seckillInfo["goods_id"] = secResp.GoodsId
+		seckillInfo["token"] = secResp.Token
+		seckillInfo["tokenTime"] = secResp.TokenTime
+		return
+	}
 	return
 }
 
@@ -269,6 +301,12 @@ func (s *proxyService) run() {
 		// s.waitGroup.Add(1)
 		go s.writeProxySecRequestToRedis(i)
 	}
+	// redis read LogicService SecRespChan from redis
+	for i := 0; i < conf.G_proxyConf.GoroutineNumReadLogicResponseFromRedis; i++ {
+		// s.waitGroup.Add(1)
+		go s.readLogicSecResponseFromRedis(i)
+	}
+
 	logs.Debug("seckill proxy run all goroutine start ... ")
 	// s.waitGroup.Wait()
 	time.Sleep(10 * time.Second)
@@ -302,5 +340,59 @@ func (s *proxyService) writeProxySecRequestToRedis(goroutineNo int) {
 			conn.Close()
 			continue
 		}
+	}
+}
+
+func (s *proxyService) readLogicSecResponseFromRedis(goroutineNo int) {
+	var (
+		conn                  redis.Conn
+		reply                 interface{}
+		err                   error
+		data                  string
+		secResp               response.SecResponse
+		userSeckillGoodsKey   string
+		ok                    bool
+		secReqRelatedRespChan chan *response.SecResponse
+	)
+	logs.Debug("seckill proxy goroutine starting 2 readLogicSecResponseFromRedis gNo = %d", goroutineNo)
+
+	conn = envinit.G_envInit.RedisLogicToProxyPool.Get()
+	defer conn.Close()
+
+	for {
+		if conn == nil {
+			conn = envinit.G_envInit.RedisLogicToProxyPool.Get()
+		}
+		reply, err = conn.Do("RPOP", constant.RedisQueueSecResp)
+		data, err = redis.String(reply, err)
+		if err == redis.ErrNil {
+			// 从 Redis RPOP Queue 得到空值,连接正常，只是Redis Queue此时没有数据
+			// 睡眠1秒 等待 Redis Queue 有数据
+			time.Sleep(time.Second)
+			continue
+		}
+		logs.Debug("seckill proxy RPOP SecResponse from Redis success data = %s", data)
+
+		if err != nil {
+			logs.Error("seckill proxy RPOP SecResponse from Redis err = %v", err)
+			conn.Close()
+			continue
+		}
+
+		err = json.Unmarshal([]byte(data), &secResp)
+		if err != nil {
+			logs.Error("seckill proxy json.Unmarshal SecResponse err = %v", err)
+			continue
+		}
+
+		userSeckillGoodsKey = fmt.Sprintf("%d_%d", secResp.UserId, secResp.GoodsId)
+		s.allUsersSecRespMapLock.Lock()
+		secReqRelatedRespChan, ok = s.allUsersSecRespMap[userSeckillGoodsKey]
+		s.allUsersSecRespMapLock.Unlock()
+		if !ok {
+			logs.Warn("seckill proxy user not found : %v", userSeckillGoodsKey)
+			continue
+		}
+		secReqRelatedRespChan <- &secResp
 	}
 }
